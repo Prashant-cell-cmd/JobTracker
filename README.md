@@ -1,6 +1,6 @@
 # JobTracker
 
-A cross-platform Expo app for tracking job applications, backed by an Express REST API and SQLite database.
+A cross-platform Expo app for tracking job applications, backed by an Express REST API. The API uses SQLite for local development and PostgreSQL when `DATABASE_URL` is configured.
 
 ## Get started
 
@@ -9,14 +9,16 @@ A cross-platform Expo app for tracking job applications, backed by an Express RE
 3. Start the API: `npm run api`
 4. In a second terminal, start Expo: `npm run web` or `npm start`.
 
-The API listens on `http://127.0.0.1:3001` by default and creates its SQLite database at `server/data/jobtracker.sqlite`.
+The API listens on `http://127.0.0.1:3001` by default and creates its local SQLite database at `server/data/jobtracker.sqlite`.
 The app's default API URL is `http://localhost:3001/api`.
 
 Create an account in the app on first use. Passwords are hashed with Node.js `scrypt`; the API stores only hashes of random bearer session tokens. Native sessions are stored with Expo SecureStore, and web sessions use browser session storage. Sessions expire after 30 days and can be revoked by signing out.
 
 For an Android emulator, set `API_HOST=0.0.0.0` and `EXPO_PUBLIC_API_URL=http://10.0.2.2:3001/api`. For a physical device on the same network, also bind to `0.0.0.0` and use the development computer's LAN IP in the API URL. Add the web app's origin to `EXPO_WEB_ORIGINS` if it differs from the defaults.
 
-The API binds to loopback by default for local development. The optional Render deployment below uses HTTPS, a single API instance, and a persistent disk for SQLite. Authentication rate limiting is in-memory and resets on restart, so this setup is intended for a small project; use a shared rate limiter, tested backups, and a managed database before scaling or relying on it for critical data. The first account registered against an existing database takes ownership of its previously unowned applications; subsequent accounts see only their own records. Existing applications in AsyncStorage are imported into the signed-in account on its first successful API connection.
+The API binds to loopback by default for local development. When `DATABASE_URL` is set, the API connects to PostgreSQL and creates its tables and indexes on startup; otherwise it uses SQLite. The first account registered against a local database takes ownership of its previously unowned applications; subsequent accounts see only their own records. Existing applications in AsyncStorage are imported into the signed-in account on its first successful API connection.
+
+The hosted Neon database starts empty. Local SQLite records are not automatically copied to it; import device-local applications by signing in and letting the app sync them after deployment. Authentication rate limiting is in-memory and resets when the Render service restarts, so this free setup is intended for a small project rather than critical data or high traffic.
 
 ## API
 
@@ -38,12 +40,13 @@ The API validates request bodies, applies Helmet security headers, limits authen
 
 ## Deploy the web app
 
-The public web app is served from GitHub Pages, while the Express API and SQLite database run separately on Render. GitHub Pages cannot run the API.
+The public web app is served from GitHub Pages, the Express API runs on Render Free, and PostgreSQL is hosted on Neon Free. GitHub Pages cannot run the API or database. Free service limits and terms can change; confirm current provider pricing before creating resources. Render's free web service may sleep while idle, so the first request after inactivity can take longer.
 
-1. In Render, create a **Blueprint** from this repository. The root `render.yaml` configures the API with a paid service plan and a 1 GB persistent disk. Review Render's current pricing before confirming. Keep the service at one instance because the SQLite database is local to its disk.
-2. After Render deploys, copy the service URL. In the GitHub repository, open **Settings → Secrets and variables → Actions → Variables** and add `EXPO_PUBLIC_API_URL` with the value `https://<your-render-service>.onrender.com/api`. Until this variable exists, the Pages workflow skips deployment.
-3. In **Settings → Pages**, set the publishing source to **GitHub Actions**.
-4. Open **Actions → Deploy web to GitHub Pages** and run the workflow on `main`. If a push happened before the API URL was configured, run the workflow manually after setup. Future pushes to `main` deploy automatically.
+1. Create a project on Neon and copy its PostgreSQL connection string. Keep it private; do not commit it or share it in chat.
+2. In Render, create a **Blueprint** from this repository. Set the prompted `DATABASE_URL` environment variable to the Neon connection string. The Blueprint uses a free API service and does not attach a local disk.
+3. After Render deploys, copy the service URL. In the GitHub repository, open **Settings → Secrets and variables → Actions → Variables** and add `EXPO_PUBLIC_API_URL` with the value `https://<your-render-service>.onrender.com/api`. Until this variable exists, the Pages workflow skips deployment.
+4. In **Settings → Pages**, set the publishing source to **GitHub Actions**.
+5. Open **Actions → Deploy web to GitHub Pages** and run the workflow on `main`. If a push happened before the API URL was configured, run the workflow manually after setup. Future pushes to `main` deploy automatically.
 
 The expected site URL is `https://prashant-cell-cmd.github.io/JobTracker/`. The Render Blueprint allows that site's origin; if you use a custom domain, update `EXPO_WEB_ORIGINS` on Render to match it.
 

@@ -4,11 +4,12 @@ import Database from 'better-sqlite3';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DataType, newDb } from 'pg-mem';
 import test from 'node:test';
 
 import { createApp } from './app';
 import { extractCandidateProfile } from './candidate-profile';
-import { createDatabase } from './database';
+import { createDatabase, initializePostgresDatabase } from './database';
 import { listJobs } from './jobs-repository';
 
 type SessionResponse = {
@@ -341,8 +342,121 @@ test('authenticated jobs API preserves legacy data and isolates user accounts', 
   });
   database.close();
   database = createDatabase(databasePath);
-  assert.deepEqual(listJobs(database, firstSession.user.id).map((job) => job.id), [
+  assert.deepEqual((await listJobs(database, firstSession.user.id)).map((job) => job.id), [
     'legacy-import-id',
     'legacy-job-id',
   ]);
+});
+
+test('PostgreSQL-backed API supports account, profile, and job persistence', async (context) => {
+  const postgres = newDb();
+  postgres.public.registerFunction({
+    name: 'trim',
+    args: [DataType.text],
+    returns: DataType.text,
+    implementation: (value: string) => value.trim(),
+  });
+  postgres.public.registerFunction({
+    name: 'length',
+    args: [DataType.text],
+    returns: DataType.integer,
+    implementation: (value: string) => value.length,
+  });
+  const { Pool: InMemoryPool } = postgres.adapters.createPg();
+  const database = new InMemoryPool();
+  await initializePostgresDatabase(database);
+
+  const server = createApp(database).listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  const baseUrl = `http://127.0.0.1:${address.port}/api`;
+
+  context.after(async () => {
+    if (server.listening) {
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => error ? reject(error) : resolve());
+      });
+    }
+    await database.end();
+  });
+
+  const registerResponse = await fetch(`${baseUrl}/auth/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: 'postgres@example.com', password: 'a-secure-test-password' }),
+  });
+  assert.equal(registerResponse.status, 201);
+  const session = await registerResponse.json() as SessionResponse;
+
+  const profileResponse = await fetch(`${baseUrl}/profile`, { headers: authHeaders(session.token) });
+  assert.deepEqual(await profileResponse.json(), { fullName: '', email: '', phone: '', skills: [] });
+  const saveProfileResponse = await fetch(`${baseUrl}/profile`, {
+    method: 'PUT',
+    headers: { ...authHeaders(session.token), 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      fullName: 'Postgres User',
+      email: 'postgres@example.com',
+      phone: '',
+      skills: ['SQL'],
+    }),
+  });
+  assert.equal(saveProfileResponse.status, 200);
+
+  const createJobResponse = await fetch(`${baseUrl}/jobs`, {
+    method: 'POST',
+    headers: { ...authHeaders(session.token), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ company: 'Neon', title: 'Database Engineer' }),
+  });
+  assert.equal(createJobResponse.status, 201);
+  const createdJob = await createJobResponse.json() as { id: string };
+
+  const updateResponse = await fetch(`${baseUrl}/jobs/${createdJob.id}/status`, {
+    method: 'PATCH',
+    headers: { ...authHeaders(session.token), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ status: 'Interview' }),
+  });
+  assert.equal(updateResponse.status, 200);
+  assert.equal((await updateResponse.json() as { status: string }).status, 'Interview');
+
+  const listResponse = await fetch(`${baseUrl}/jobs`, { headers: authHeaders(session.token) });
+  const jobs = await listResponse.json() as { id: string; company: string }[];
+  assert.deepEqual(jobs.map(({ id, company }) => ({ id, company })), [
+    { id: createdJob.id, company: 'Neon' },
+  ]);
+
+  const editResponse = await fetch(`${baseUrl}/jobs/${createdJob.id}`, {
+    method: 'PUT',
+    headers: { ...authHeaders(session.token), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ company: 'Neon', title: 'Senior Database Engineer' }),
+  });
+  assert.equal(editResponse.status, 200);
+  assert.equal((await editResponse.json() as { title: string }).title, 'Senior Database Engineer');
+
+  const importedJob = {
+    id: 'postgres-imported-job',
+    company: 'Imported Co',
+    title: 'Platform Engineer',
+    createdAt: '2025-01-01T00:00:00.000Z',
+  };
+  const importResponse = await fetch(`${baseUrl}/jobs/import`, {
+    method: 'POST',
+    headers: { ...authHeaders(session.token), 'Content-Type': 'application/json' },
+    body: JSON.stringify([importedJob]),
+  });
+  assert.equal(importResponse.status, 200);
+  assert.equal((await importResponse.json() as { imported: number }).imported, 1);
+
+  const loginResponse = await fetch(`${baseUrl}/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: 'POSTGRES@example.com', password: 'a-secure-test-password' }),
+  });
+  assert.equal(loginResponse.status, 200);
+
+  const deleteResponse = await fetch(`${baseUrl}/jobs/${createdJob.id}`, {
+    method: 'DELETE',
+    headers: authHeaders(session.token),
+  });
+  assert.equal(deleteResponse.status, 204);
 });

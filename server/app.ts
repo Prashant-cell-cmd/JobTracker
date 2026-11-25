@@ -10,7 +10,7 @@ import helmet from 'helmet';
 import multer from 'multer';
 import { z } from 'zod';
 
-import type { SqliteDatabase } from './database';
+import type { AppDatabase } from './database';
 import { parseResume } from './candidate-profile';
 import {
   createJob,
@@ -135,12 +135,12 @@ async function verifyPassword(password: string, storedHash: string): Promise<boo
   return timingSafeEqual(storedKey, derivedKey);
 }
 
-function issueSession(database: SqliteDatabase, user: User) {
+async function issueSession(database: AppDatabase, user: User) {
   const token = randomBytes(32).toString('base64url');
   const now = new Date();
   const expiresAt = new Date(now.getTime() + SESSION_LIFETIME_MS).toISOString();
-  deleteExpiredSessions(database, now.toISOString());
-  createSession(database, hashToken(token), user.id, expiresAt, now.toISOString());
+  await deleteExpiredSessions(database, now.toISOString());
+  await createSession(database, hashToken(token), user.id, expiresAt, now.toISOString());
   return { token, expiresAt, user };
 }
 
@@ -150,7 +150,7 @@ function getAuthenticatedUser(response: Response): User {
   return user;
 }
 
-export function createApp(database: SqliteDatabase) {
+export function createApp(database: AppDatabase) {
   const app = express();
   app.disable('x-powered-by');
   app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
@@ -185,7 +185,7 @@ export function createApp(database: SqliteDatabase) {
     },
   });
 
-  const requireAuth: express.RequestHandler = (request, response, next) => {
+  const requireAuth: express.RequestHandler = async (request, response, next) => {
     const authorization = request.get('authorization');
     const match = authorization?.match(/^Bearer ([A-Za-z0-9_-]{40,})$/);
     if (!match) {
@@ -193,7 +193,7 @@ export function createApp(database: SqliteDatabase) {
       return;
     }
 
-    const user = getUserBySession(database, hashToken(match[1]), new Date().toISOString());
+    const user = await getUserBySession(database, hashToken(match[1]), new Date().toISOString());
     if (!user) {
       response.status(401).json({ error: 'Your session is invalid or has expired. Please sign in again.' });
       return;
@@ -211,7 +211,7 @@ export function createApp(database: SqliteDatabase) {
     const credentials = parseBody(credentialsSchema, request, response);
     if (!credentials) return;
 
-    const user = createUser(database, {
+    const user = await createUser(database, {
       id: randomUUID(),
       email: credentials.email,
       passwordHash: await hashPassword(credentials.password),
@@ -221,14 +221,14 @@ export function createApp(database: SqliteDatabase) {
       response.status(409).json({ error: 'An account with this email already exists.' });
       return;
     }
-    response.status(201).json(issueSession(database, user));
+    response.status(201).json(await issueSession(database, user));
   });
 
   app.post('/api/auth/login', authRateLimit, async (request, response) => {
     const credentials = parseBody(credentialsSchema, request, response);
     if (!credentials) return;
 
-    const userWithPassword = getUserByEmail(database, credentials.email);
+    const userWithPassword = await getUserByEmail(database, credentials.email);
     const storedHash = userWithPassword?.passwordHash ?? await dummyPasswordHash;
     const validPassword = await verifyPassword(credentials.password, storedHash);
     if (!userWithPassword || !validPassword) {
@@ -237,21 +237,21 @@ export function createApp(database: SqliteDatabase) {
     }
 
     const { passwordHash: _passwordHash, ...user } = userWithPassword;
-    response.json(issueSession(database, user));
+    response.json(await issueSession(database, user));
   });
 
   app.get('/api/auth/me', requireAuth, (_request, response) => {
     response.json({ user: getAuthenticatedUser(response) });
   });
 
-  app.get('/api/profile', requireAuth, (_request, response) => {
-    response.json(getCandidateProfile(database, getAuthenticatedUser(response).id));
+  app.get('/api/profile', requireAuth, async (_request, response) => {
+    response.json(await getCandidateProfile(database, getAuthenticatedUser(response).id));
   });
 
-  app.put('/api/profile', requireAuth, (request, response) => {
+  app.put('/api/profile', requireAuth, async (request, response) => {
     const profile = parseBody(candidateProfileSchema, request, response);
     if (!profile) return;
-    response.json(saveCandidateProfile(database, getAuthenticatedUser(response).id, profile));
+    response.json(await saveCandidateProfile(database, getAuthenticatedUser(response).id, profile));
   });
 
   app.post('/api/profile/parse-resume', requireAuth, (request, response, next) => {
@@ -280,23 +280,23 @@ export function createApp(database: SqliteDatabase) {
     }
   });
 
-  app.post('/api/auth/logout', requireAuth, (_request, response) => {
-    deleteSession(database, response.locals.sessionTokenHash as string);
+  app.post('/api/auth/logout', requireAuth, async (_request, response) => {
+    await deleteSession(database, response.locals.sessionTokenHash as string);
     response.sendStatus(204);
   });
 
   app.use('/api/jobs', requireAuth);
 
-  app.get('/api/jobs', (_request, response) => {
-    response.json(listJobs(database, getAuthenticatedUser(response).id));
+  app.get('/api/jobs', async (_request, response) => {
+    response.json(await listJobs(database, getAuthenticatedUser(response).id));
   });
 
-  app.post('/api/jobs', (request, response) => {
+  app.post('/api/jobs', async (request, response) => {
     const input = parseBody<JobInput>(jobInputSchema, request, response);
     if (!input) return;
 
     const now = new Date().toISOString();
-    const job = createJob(database, getAuthenticatedUser(response).id, {
+    const job = await createJob(database, getAuthenticatedUser(response).id, {
       id: randomUUID(),
       ...input,
       createdAt: now,
@@ -305,21 +305,21 @@ export function createApp(database: SqliteDatabase) {
     response.status(201).json(job);
   });
 
-  app.post('/api/jobs/import', (request, response) => {
+  app.post('/api/jobs/import', async (request, response) => {
     const schema = z.array(importedJobSchema).max(500);
     const jobs = parseBody<ImportedJob[]>(schema, request, response);
     if (!jobs) return;
 
     const userId = getAuthenticatedUser(response).id;
-    const imported = importJobs(database, userId, jobs);
-    response.status(200).json({ imported, jobs: listJobs(database, userId) });
+    const imported = await importJobs(database, userId, jobs);
+    response.status(200).json({ imported, jobs: await listJobs(database, userId) });
   });
 
-  app.get('/api/jobs/:id', (request, response) => {
+  app.get('/api/jobs/:id', async (request, response) => {
     const id = readId(request, response);
     if (!id) return;
 
-    const job = getJob(database, id, getAuthenticatedUser(response).id);
+    const job = await getJob(database, id, getAuthenticatedUser(response).id);
     if (!job) {
       response.status(404).json({ error: 'Application not found.' });
       return;
@@ -327,14 +327,14 @@ export function createApp(database: SqliteDatabase) {
     response.json(job);
   });
 
-  app.put('/api/jobs/:id', (request, response) => {
+  app.put('/api/jobs/:id', async (request, response) => {
     const id = readId(request, response);
     if (!id) return;
 
     const details = parseBody<JobInput>(jobInputSchema, request, response);
     if (!details) return;
 
-    const job = updateJob(database, id, getAuthenticatedUser(response).id, details, new Date().toISOString());
+    const job = await updateJob(database, id, getAuthenticatedUser(response).id, details, new Date().toISOString());
     if (!job) {
       response.status(404).json({ error: 'Application not found.' });
       return;
@@ -342,14 +342,20 @@ export function createApp(database: SqliteDatabase) {
     response.json(job);
   });
 
-  app.patch('/api/jobs/:id/status', (request, response) => {
+  app.patch('/api/jobs/:id/status', async (request, response) => {
     const id = readId(request, response);
     if (!id) return;
 
     const body = parseBody<{ status: (typeof jobStatuses)[number] }>(statusSchema, request, response);
     if (!body) return;
 
-    const job = updateJobStatus(database, id, getAuthenticatedUser(response).id, body.status, new Date().toISOString());
+    const job = await updateJobStatus(
+      database,
+      id,
+      getAuthenticatedUser(response).id,
+      body.status,
+      new Date().toISOString(),
+    );
     if (!job) {
       response.status(404).json({ error: 'Application not found.' });
       return;
@@ -357,11 +363,11 @@ export function createApp(database: SqliteDatabase) {
     response.json(job);
   });
 
-  app.delete('/api/jobs/:id', (request, response) => {
+  app.delete('/api/jobs/:id', async (request, response) => {
     const id = readId(request, response);
     if (!id) return;
 
-    if (!deleteJob(database, id, getAuthenticatedUser(response).id)) {
+    if (!await deleteJob(database, id, getAuthenticatedUser(response).id)) {
       response.status(404).json({ error: 'Application not found.' });
       return;
     }

@@ -1,6 +1,7 @@
-import type { SqliteDatabase } from './database';
-import type { ImportedJob, Job, JobInput, JobStatus } from './types';
+import type { Pool, QueryResultRow } from 'pg';
 import type { CandidateProfile } from '../src/types/candidate-profile';
+import { isSqliteDatabase, type AppDatabase, type SqliteDatabase } from './database';
+import type { ImportedJob, Job, JobInput, JobStatus } from './types';
 
 export type User = {
   id: string;
@@ -8,33 +9,7 @@ export type User = {
   createdAt: string;
 };
 
-export function getCandidateProfile(database: SqliteDatabase, userId: string): CandidateProfile {
-  const row = database.prepare(`
-    SELECT full_name, email, phone, skills FROM candidate_profiles WHERE user_id = ?
-  `).get(userId) as { full_name: string; email: string; phone: string; skills: string } | undefined;
-  return row
-    ? { fullName: row.full_name, email: row.email, phone: row.phone, skills: JSON.parse(row.skills) as string[] }
-    : { fullName: '', email: '', phone: '', skills: [] };
-}
-
-export function saveCandidateProfile(
-  database: SqliteDatabase,
-  userId: string,
-  profile: CandidateProfile,
-): CandidateProfile {
-  database.prepare(`
-    INSERT INTO candidate_profiles (user_id, full_name, email, phone, skills)
-    VALUES (?, ?, ?, ?, ?)
-    ON CONFLICT(user_id) DO UPDATE SET
-      full_name = excluded.full_name,
-      email = excluded.email,
-      phone = excluded.phone,
-      skills = excluded.skills
-  `).run(userId, profile.fullName, profile.email, profile.phone, JSON.stringify(profile.skills));
-  return profile;
-}
-
-type JobRow = {
+type JobRow = QueryResultRow & {
   id: string;
   company: string;
   title: string;
@@ -49,7 +24,7 @@ type JobRow = {
   updated_at: string;
 };
 
-type UserRow = {
+type UserRow = QueryResultRow & {
   id: string;
   email: string;
   created_at: string;
@@ -76,99 +51,235 @@ function toUser(row: UserRow): User {
   return { id: row.id, email: row.email, createdAt: row.created_at };
 }
 
-export function getUserByEmail(database: SqliteDatabase, email: string): (User & { passwordHash: string }) | undefined {
-  const row = database.prepare(`
+export async function getCandidateProfile(database: AppDatabase, userId: string): Promise<CandidateProfile> {
+  if (isSqliteDatabase(database)) {
+    const row = database.prepare(`
+      SELECT full_name, email, phone, skills FROM candidate_profiles WHERE user_id = ?
+    `).get(userId) as { full_name: string; email: string; phone: string; skills: string } | undefined;
+    return row
+      ? { fullName: row.full_name, email: row.email, phone: row.phone, skills: JSON.parse(row.skills) as string[] }
+      : { fullName: '', email: '', phone: '', skills: [] };
+  }
+
+  const { rows } = await database.query<{
+    full_name: string;
+    email: string;
+    phone: string;
+    skills: string;
+  }>(`
+    SELECT full_name, email, phone, skills FROM candidate_profiles WHERE user_id = $1
+  `, [userId]);
+  const row = rows[0];
+  return row
+    ? { fullName: row.full_name, email: row.email, phone: row.phone, skills: JSON.parse(row.skills) as string[] }
+    : { fullName: '', email: '', phone: '', skills: [] };
+}
+
+export async function saveCandidateProfile(
+  database: AppDatabase,
+  userId: string,
+  profile: CandidateProfile,
+): Promise<CandidateProfile> {
+  if (isSqliteDatabase(database)) {
+    database.prepare(`
+      INSERT INTO candidate_profiles (user_id, full_name, email, phone, skills)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(user_id) DO UPDATE SET
+        full_name = excluded.full_name,
+        email = excluded.email,
+        phone = excluded.phone,
+        skills = excluded.skills
+    `).run(userId, profile.fullName, profile.email, profile.phone, JSON.stringify(profile.skills));
+    return profile;
+  }
+
+  await database.query(`
+    INSERT INTO candidate_profiles (user_id, full_name, email, phone, skills)
+    VALUES ($1, $2, $3, $4, $5)
+    ON CONFLICT(user_id) DO UPDATE SET
+      full_name = EXCLUDED.full_name,
+      email = EXCLUDED.email,
+      phone = EXCLUDED.phone,
+      skills = EXCLUDED.skills
+  `, [userId, profile.fullName, profile.email, profile.phone, JSON.stringify(profile.skills)]);
+  return profile;
+}
+
+export async function getUserByEmail(
+  database: AppDatabase,
+  email: string,
+): Promise<(User & { passwordHash: string }) | undefined> {
+  if (isSqliteDatabase(database)) {
+    const row = database.prepare(`
+      SELECT id, email, password_hash, created_at
+      FROM users WHERE email = ?
+    `).get(email) as (UserRow & { password_hash: string }) | undefined;
+    return row ? { ...toUser(row), passwordHash: row.password_hash } : undefined;
+  }
+
+  const { rows } = await database.query<UserRow & { password_hash: string }>(`
     SELECT id, email, password_hash, created_at
-    FROM users WHERE email = ?
-  `).get(email) as (UserRow & { password_hash: string }) | undefined;
+    FROM users WHERE LOWER(email) = LOWER($1)
+  `, [email]);
+  const row = rows[0];
   return row ? { ...toUser(row), passwordHash: row.password_hash } : undefined;
 }
 
-export function createUser(
-  database: SqliteDatabase,
+export async function createUser(
+  database: AppDatabase,
   user: User & { passwordHash: string },
-): User | undefined {
-  const register = database.transaction((newUser: User & { passwordHash: string }) => {
-    if (getUserByEmail(database, newUser.email)) return undefined;
+): Promise<User | undefined> {
+  if (isSqliteDatabase(database)) {
+    const register = database.transaction((newUser: User & { passwordHash: string }) => {
+      if (database.prepare('SELECT id FROM users WHERE email = ?').get(newUser.email)) return undefined;
 
-    database.prepare(`
+      database.prepare(`
+        INSERT INTO users (id, email, password_hash, created_at)
+        VALUES (?, ?, ?, ?)
+      `).run(newUser.id, newUser.email, newUser.passwordHash, newUser.createdAt);
+
+      const userCount = database.prepare('SELECT COUNT(*) AS count FROM users').get() as { count: number };
+      if (userCount.count === 1) {
+        database.prepare('UPDATE jobs SET user_id = ? WHERE user_id IS NULL').run(newUser.id);
+      }
+
+      return { id: newUser.id, email: newUser.email, createdAt: newUser.createdAt };
+    });
+
+    return register.immediate(user);
+  }
+
+  const client = await database.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query<UserRow & { password_hash: string }>(`
       INSERT INTO users (id, email, password_hash, created_at)
-      VALUES (?, ?, ?, ?)
-    `).run(newUser.id, newUser.email, newUser.passwordHash, newUser.createdAt);
-
-    const userCount = database.prepare('SELECT COUNT(*) AS count FROM users').get() as { count: number };
-    if (userCount.count === 1) {
-      database.prepare('UPDATE jobs SET user_id = ? WHERE user_id IS NULL').run(newUser.id);
+      VALUES ($1, $2, $3, $4)
+      ON CONFLICT (email) DO NOTHING
+      RETURNING id, email, password_hash, created_at
+    `, [user.id, user.email, user.passwordHash, user.createdAt]);
+    const createdUser = rows[0];
+    if (!createdUser) {
+      await client.query('ROLLBACK');
+      return undefined;
     }
 
-    return {
-      id: newUser.id,
-      email: newUser.email,
-      createdAt: newUser.createdAt,
-    };
-  });
-
-  return register.immediate(user);
+    const userCount = await client.query<{ count: string } & QueryResultRow>(
+      'SELECT COUNT(*) AS count FROM users',
+    );
+    if (Number(userCount.rows[0].count) === 1) {
+      await client.query('UPDATE jobs SET user_id = $1 WHERE user_id IS NULL', [user.id]);
+    }
+    await client.query('COMMIT');
+    return toUser(createdUser);
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
-export function createSession(
-  database: SqliteDatabase,
+export async function createSession(
+  database: AppDatabase,
   tokenHash: string,
   userId: string,
   expiresAt: string,
   createdAt: string,
-): void {
-  database.prepare(`
+): Promise<void> {
+  if (isSqliteDatabase(database)) {
+    database.prepare(`
+      INSERT INTO sessions (token_hash, user_id, expires_at, created_at)
+      VALUES (?, ?, ?, ?)
+    `).run(tokenHash, userId, expiresAt, createdAt);
+    return;
+  }
+
+  await database.query(`
     INSERT INTO sessions (token_hash, user_id, expires_at, created_at)
-    VALUES (?, ?, ?, ?)
-  `).run(tokenHash, userId, expiresAt, createdAt);
+    VALUES ($1, $2, $3, $4)
+  `, [tokenHash, userId, expiresAt, createdAt]);
 }
 
-export function getUserBySession(
-  database: SqliteDatabase,
+export async function getUserBySession(
+  database: AppDatabase,
   tokenHash: string,
   now: string,
-): User | undefined {
-  const row = database.prepare(`
+): Promise<User | undefined> {
+  if (isSqliteDatabase(database)) {
+    const row = database.prepare(`
+      SELECT users.id, users.email, users.created_at
+      FROM sessions
+      JOIN users ON users.id = sessions.user_id
+      WHERE sessions.token_hash = ? AND sessions.expires_at > ?
+    `).get(tokenHash, now) as UserRow | undefined;
+    if (!row) {
+      database.prepare('DELETE FROM sessions WHERE token_hash = ? AND expires_at <= ?').run(tokenHash, now);
+      return undefined;
+    }
+    return toUser(row);
+  }
+
+  const { rows } = await database.query<UserRow>(`
     SELECT users.id, users.email, users.created_at
     FROM sessions
     JOIN users ON users.id = sessions.user_id
-    WHERE sessions.token_hash = ? AND sessions.expires_at > ?
-  `).get(tokenHash, now) as UserRow | undefined;
+    WHERE sessions.token_hash = $1 AND sessions.expires_at > $2
+  `, [tokenHash, now]);
+  const row = rows[0];
   if (!row) {
-    database.prepare('DELETE FROM sessions WHERE token_hash = ? AND expires_at <= ?').run(tokenHash, now);
+    await database.query('DELETE FROM sessions WHERE token_hash = $1 AND expires_at <= $2', [tokenHash, now]);
     return undefined;
   }
   return toUser(row);
 }
 
-export function deleteSession(database: SqliteDatabase, tokenHash: string): void {
-  database.prepare('DELETE FROM sessions WHERE token_hash = ?').run(tokenHash);
+export async function deleteSession(database: AppDatabase, tokenHash: string): Promise<void> {
+  if (isSqliteDatabase(database)) {
+    database.prepare('DELETE FROM sessions WHERE token_hash = ?').run(tokenHash);
+    return;
+  }
+  await database.query('DELETE FROM sessions WHERE token_hash = $1', [tokenHash]);
 }
 
-export function deleteExpiredSessions(database: SqliteDatabase, now: string): void {
-  database.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(now);
+export async function deleteExpiredSessions(database: AppDatabase, now: string): Promise<void> {
+  if (isSqliteDatabase(database)) {
+    database.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(now);
+    return;
+  }
+  await database.query('DELETE FROM sessions WHERE expires_at <= $1', [now]);
 }
 
-export function listJobs(database: SqliteDatabase, userId: string): Job[] {
-  const rows = database
-    .prepare('SELECT * FROM jobs WHERE user_id = ? ORDER BY created_at DESC, rowid DESC')
-    .all(userId) as unknown as JobRow[];
+export async function listJobs(database: AppDatabase, userId: string): Promise<Job[]> {
+  if (isSqliteDatabase(database)) {
+    const rows = database
+      .prepare('SELECT * FROM jobs WHERE user_id = ? ORDER BY created_at DESC, rowid DESC')
+      .all(userId) as unknown as JobRow[];
+    return rows.map(toJob);
+  }
+
+  const { rows } = await database.query<JobRow>(
+    'SELECT * FROM jobs WHERE user_id = $1 ORDER BY created_at DESC, id DESC',
+    [userId],
+  );
   return rows.map(toJob);
 }
 
-export function getJob(database: SqliteDatabase, id: string, userId: string): Job | undefined {
-  const row = database.prepare('SELECT * FROM jobs WHERE id = ? AND user_id = ?').get(id, userId) as JobRow | undefined;
-  return row ? toJob(row) : undefined;
+export async function getJob(database: AppDatabase, id: string, userId: string): Promise<Job | undefined> {
+  if (isSqliteDatabase(database)) {
+    const row = database.prepare('SELECT * FROM jobs WHERE id = ? AND user_id = ?').get(id, userId) as JobRow | undefined;
+    return row ? toJob(row) : undefined;
+  }
+
+  const { rows } = await database.query<JobRow>(
+    'SELECT * FROM jobs WHERE id = $1 AND user_id = $2',
+    [id, userId],
+  );
+  return rows[0] ? toJob(rows[0]) : undefined;
 }
 
-export function createJob(database: SqliteDatabase, userId: string, job: Job): Job {
-  database.prepare(`
-    INSERT INTO jobs (
-      id, company, title, location, salary, notes, application_url,
-      resume_name, resume_uri, status, created_at, updated_at, user_id
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
+export async function createJob(database: AppDatabase, userId: string, job: Job): Promise<Job> {
+  const values = [
     job.id,
     job.company,
     job.title,
@@ -182,23 +293,34 @@ export function createJob(database: SqliteDatabase, userId: string, job: Job): J
     job.createdAt,
     job.updatedAt,
     userId,
-  );
+  ];
+  if (isSqliteDatabase(database)) {
+    database.prepare(`
+      INSERT INTO jobs (
+        id, company, title, location, salary, notes, application_url,
+        resume_name, resume_uri, status, created_at, updated_at, user_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(...values);
+    return job;
+  }
+
+  await database.query(`
+    INSERT INTO jobs (
+      id, company, title, location, salary, notes, application_url,
+      resume_name, resume_uri, status, created_at, updated_at, user_id
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+  `, values);
   return job;
 }
 
-export function updateJob(
-  database: SqliteDatabase,
+export async function updateJob(
+  database: AppDatabase,
   id: string,
   userId: string,
   details: JobInput,
   updatedAt: string,
-): Job | undefined {
-  const result = database.prepare(`
-    UPDATE jobs
-    SET company = ?, title = ?, location = ?, salary = ?, notes = ?,
-        application_url = ?, resume_name = ?, resume_uri = ?, status = ?, updated_at = ?
-    WHERE id = ? AND user_id = ?
-  `).run(
+): Promise<Job | undefined> {
+  const values = [
     details.company,
     details.title,
     details.location,
@@ -211,57 +333,103 @@ export function updateJob(
     updatedAt,
     id,
     userId,
-  );
-  return result.changes ? getJob(database, id, userId) : undefined;
+  ];
+  if (isSqliteDatabase(database)) {
+    const result = database.prepare(`
+      UPDATE jobs
+      SET company = ?, title = ?, location = ?, salary = ?, notes = ?,
+          application_url = ?, resume_name = ?, resume_uri = ?, status = ?, updated_at = ?
+      WHERE id = ? AND user_id = ?
+    `).run(...values);
+    return result.changes ? getJob(database, id, userId) : undefined;
+  }
+
+  const result = await database.query(`
+    UPDATE jobs
+    SET company = $1, title = $2, location = $3, salary = $4, notes = $5,
+        application_url = $6, resume_name = $7, resume_uri = $8, status = $9, updated_at = $10
+    WHERE id = $11 AND user_id = $12
+  `, values);
+  return result.rowCount ? getJob(database, id, userId) : undefined;
 }
 
-export function updateJobStatus(
-  database: SqliteDatabase,
+export async function updateJobStatus(
+  database: AppDatabase,
   id: string,
   userId: string,
   status: JobStatus,
   updatedAt: string,
-): Job | undefined {
-  const result = database
-    .prepare('UPDATE jobs SET status = ?, updated_at = ? WHERE id = ? AND user_id = ?')
-    .run(status, updatedAt, id, userId);
-  return result.changes ? getJob(database, id, userId) : undefined;
+): Promise<Job | undefined> {
+  if (isSqliteDatabase(database)) {
+    const result = database
+      .prepare('UPDATE jobs SET status = ?, updated_at = ? WHERE id = ? AND user_id = ?')
+      .run(status, updatedAt, id, userId);
+    return result.changes ? getJob(database, id, userId) : undefined;
+  }
+
+  const result = await database.query(
+    'UPDATE jobs SET status = $1, updated_at = $2 WHERE id = $3 AND user_id = $4',
+    [status, updatedAt, id, userId],
+  );
+  return result.rowCount ? getJob(database, id, userId) : undefined;
 }
 
-export function deleteJob(database: SqliteDatabase, id: string, userId: string): boolean {
-  return database.prepare('DELETE FROM jobs WHERE id = ? AND user_id = ?').run(id, userId).changes > 0;
+export async function deleteJob(database: AppDatabase, id: string, userId: string): Promise<boolean> {
+  if (isSqliteDatabase(database)) {
+    return database.prepare('DELETE FROM jobs WHERE id = ? AND user_id = ?').run(id, userId).changes > 0;
+  }
+  const result = await database.query('DELETE FROM jobs WHERE id = $1 AND user_id = $2', [id, userId]);
+  return (result.rowCount ?? 0) > 0;
 }
 
-export function importJobs(database: SqliteDatabase, userId: string, jobs: ImportedJob[]): number {
-  const insert = database.prepare(`
-    INSERT INTO jobs (
-      id, company, title, location, salary, notes, application_url,
-      resume_name, resume_uri, status, created_at, updated_at, user_id
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+export async function importJobs(database: AppDatabase, userId: string, jobs: ImportedJob[]): Promise<number> {
+  if (jobs.length === 0) return 0;
+
+  const columns = `
+    id, company, title, location, salary, notes, application_url,
+    resume_name, resume_uri, status, created_at, updated_at, user_id
+  `;
+  const valuesForJob = (job: ImportedJob) => [
+    job.id,
+    job.company,
+    job.title,
+    job.location,
+    job.salary,
+    job.notes,
+    job.applicationUrl,
+    job.resumeName,
+    job.resumeUri,
+    job.status,
+    job.createdAt,
+    job.createdAt,
+    userId,
+  ];
+
+  if (isSqliteDatabase(database)) {
+    const insert = database.prepare(`
+      INSERT INTO jobs (${columns})
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO NOTHING
+    `);
+    const importTransaction = database.transaction((applications: ImportedJob[]) => {
+      let imported = 0;
+      for (const job of applications) {
+        imported += insert.run(...valuesForJob(job)).changes;
+      }
+      return imported;
+    });
+    return importTransaction(jobs);
+  }
+
+  const parameters = jobs.flatMap(valuesForJob);
+  const placeholders = jobs.map((_, jobIndex) => {
+    const firstParameter = jobIndex * 13 + 1;
+    return `(${Array.from({ length: 13 }, (_value, index) => `$${firstParameter + index}`).join(', ')})`;
+  }).join(', ');
+  const result = await database.query(`
+    INSERT INTO jobs (${columns})
+    VALUES ${placeholders}
     ON CONFLICT(id) DO NOTHING
-  `);
-  const importTransaction = database.transaction((applications: ImportedJob[]) => {
-    let imported = 0;
-    for (const job of applications) {
-      const result = insert.run(
-        job.id,
-        job.company,
-        job.title,
-        job.location,
-        job.salary,
-        job.notes,
-        job.applicationUrl,
-        job.resumeName,
-        job.resumeUri,
-        job.status,
-        job.createdAt,
-        job.createdAt,
-        userId,
-      );
-      imported += result.changes;
-    }
-    return imported;
-  });
-
-  return importTransaction(jobs);
+  `, parameters);
+  return result.rowCount ?? 0;
 }
