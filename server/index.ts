@@ -2,11 +2,11 @@ import { createServer } from 'node:http';
 import { createApp } from './app';
 import { createDatabase } from './database';
 
-const port = Number(process.env.API_PORT ?? 3001);
+const port = Number(process.env.PORT || process.env.API_PORT || 3001);
 const host = process.env.API_HOST ?? '127.0.0.1';
 
 if (!Number.isInteger(port) || port < 1 || port > 65535) {
-  throw new Error('API_PORT must be an integer between 1 and 65535.');
+  throw new Error('PORT or API_PORT must be an integer between 1 and 65535.');
 }
 
 const database = createDatabase();

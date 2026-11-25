@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: jobtracker-api
+    runtime: node
+    plan: 0.5c-512mb
+    branch: main
+    numInstances: 1
+    buildCommand: npm ci --include=dev
+    startCommand: npm run api
+    healthCheckPath: /api/health
+    disk:
+      name: jobtracker-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: API_HOST
+        value: 0.0.0.0
+      - key: DATABASE_PATH
+        value: /var/data/jobtracker.sqlite
+      - key: EXPO_WEB_ORIGINS
+        value: https://prashant-cell-cmd.github.io
