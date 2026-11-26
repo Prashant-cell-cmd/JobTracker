@@ -14,4 +14,4 @@ services:
       - key: DATABASE_URL
         sync: false
       - key: EXPO_WEB_ORIGINS
-        value: https://prashant-cell-cmd.github.io
+        value: https://prashant-cell-cmd.github.io,https://job-tracker-prashant.vercel.app
